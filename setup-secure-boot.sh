@@ -174,12 +174,13 @@ generate_mok_keys() {
 sign_grub() {
     print_status "Firmando GRUB..."
     
-    local grub_efi="/boot/EFI/GRUB/grubx64.efi"
-    local grub_signed="/boot/EFI/GRUB/grubx64.efi.signed"
+    local grub_efi="/boot/EFI/BOOT/BOOTX64.efi"
+    local grub_signed="/boot/EFI/BOOT/BOOTX64.efi.signed"
     
     if [[ ! -f "$grub_efi" ]]; then
         # Buscar GRUB en otras ubicaciones comunes
         local grub_locations=(
+            "/boot/EFI/GRUB/grubx64.efi"
             "/boot/efi/EFI/GRUB/grubx64.efi"
             "/boot/efi/EFI/grub/grubx64.efi"
             "/boot/EFI/grub/grubx64.efi"
