@@ -52,12 +52,38 @@ check_root() {
     fi
 }
 
+# Función para verificar si el sistema soporta Secure Boot
+check_secure_boot_support() {
+    print_status "Verificando soporte de Secure Boot..."
+    
+    if [[ ! -d /sys/firmware/efi ]]; then
+        print_error "Sistema no es UEFI. Secure Boot requiere UEFI."
+        exit 1
+    fi
+    
+    if ! command -v mokutil &> /dev/null; then
+        print_error "mokutil no está disponible. Instalando..."
+        pacman -S --noconfirm mokutil
+    fi
+    
+    # Verificar estado de Secure Boot
+    local sb_state
+    if sb_state=$(mokutil --sb-state 2>/dev/null); then
+        print_status "Estado de Secure Boot: $sb_state"
+    else
+        print_warning "No se puede determinar el estado de Secure Boot"
+    fi
+    
+    print_success "Sistema compatible con Secure Boot"
+}
+
 # Verificar dependencias
 check_dependencies() {
     print_status "Verificando dependencias..."
     
-    local deps=("openssl" "sbsign" "mokutil" "efibootmgr")
+    local deps=("openssl" "mokutil" "efibootmgr")
     local missing_deps=()
+    local packages_to_install=()
     
     for dep in "${deps[@]}"; do
         if ! command -v "$dep" &> /dev/null; then
@@ -65,10 +91,36 @@ check_dependencies() {
         fi
     done
     
-    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+    # Verificar sbsign específicamente
+    if ! command -v "sbsign" &> /dev/null; then
+        missing_deps+=("sbsign")
+        packages_to_install+=("sbsigntools")
+    fi
+    
+    # Agregar paquetes para otras dependencias
+    for dep in "${missing_deps[@]}"; do
+        case "$dep" in
+            "mokutil"|"efibootmgr")
+                packages_to_install+=("$dep")
+                ;;
+            "openssl")
+                packages_to_install+=("openssl")
+                ;;
+        esac
+    done
+    
+    if [[ ${#packages_to_install[@]} -gt 0 ]]; then
         print_error "Faltan las siguientes dependencias: ${missing_deps[*]}"
-        print_status "Instalando dependencias faltantes..."
-        pacman -S --noconfirm "${missing_deps[@]}"
+        print_status "Instalando paquetes: ${packages_to_install[*]}"
+        pacman -S --noconfirm "${packages_to_install[@]}"
+        
+        # Verificar instalación
+        for dep in "${missing_deps[@]}"; do
+            if ! command -v "$dep" &> /dev/null; then
+                print_error "Error: No se pudo instalar $dep"
+                exit 1
+            fi
+        done
     fi
     
     print_success "Todas las dependencias están instaladas"
@@ -122,13 +174,12 @@ generate_mok_keys() {
 sign_grub() {
     print_status "Firmando GRUB..."
     
-    local grub_efi="/boot/EFI/BOOT/BOOTX64.efi"
-    local grub_signed="/boot/EFI/BOOT/BOOTX64.efi.signed"
-
+    local grub_efi="/boot/EFI/GRUB/grubx64.efi"
+    local grub_signed="/boot/EFI/GRUB/grubx64.efi.signed"
+    
     if [[ ! -f "$grub_efi" ]]; then
         # Buscar GRUB en otras ubicaciones comunes
         local grub_locations=(
-            "/boot/EFI/GRUB/grubx64.efi"
             "/boot/efi/EFI/GRUB/grubx64.efi"
             "/boot/efi/EFI/grub/grubx64.efi"
             "/boot/EFI/grub/grubx64.efi"
@@ -194,11 +245,39 @@ sign_kernels() {
 enroll_mok() {
     print_status "Registrando certificado MOK..."
     
-    # Importar el certificado MOK
-    mokutil --import "${KEYS_DIR}/${MOK_NAME}.der"
+    # Verificar que Secure Boot esté habilitado en Setup Mode o que tengamos acceso a MOK
+    if ! mokutil --sb-state &>/dev/null; then
+        print_error "No se puede acceder al estado de Secure Boot"
+        print_warning "Asegúrate de que el sistema tenga soporte UEFI y Secure Boot"
+    fi
     
-    print_success "Certificado MOK registrado para importación"
-    print_warning "Será necesario confirmar la importación después del reinicio"
+    # Verificar si ya hay MOKs pendientes
+    if mokutil --list-new &>/dev/null; then
+        print_warning "Ya hay certificados MOK pendientes de inscripción"
+        mokutil --reset
+        print_status "MOKs pendientes eliminados"
+    fi
+    
+    # Importar el certificado MOK con contraseña
+    print_status "Importando certificado MOK..."
+    echo "SecureBoot123" | mokutil --import "${KEYS_DIR}/${MOK_NAME}.der" --password
+    
+    if [[ $? -eq 0 ]]; then
+        print_success "Certificado MOK registrado para importación"
+        
+        # Verificar que el MOK esté en la cola
+        if mokutil --list-new | grep -q "Secure Boot MOK"; then
+            print_success "MOK confirmado en cola de importación"
+        else
+            print_warning "MOK podría no estar correctamente en cola"
+        fi
+    else
+        print_error "Error al registrar el certificado MOK"
+        return 1
+    fi
+    
+    print_warning "IMPORTANTE: En el próximo reinicio aparecerá MOK Manager"
+    print_warning "Contraseña para MOK Manager: SecureBoot123"
 }
 
 # Verificar estado de Secure Boot
@@ -319,6 +398,7 @@ main() {
     echo
     
     check_root
+    check_secure_boot_support
     check_dependencies
     create_keys_directory
     generate_mok_keys
@@ -337,12 +417,17 @@ main() {
     echo
     print_status "PRÓXIMOS PASOS:"
     echo "1. El sistema se reiniciará automáticamente en 10 segundos"
-    echo "2. Durante el arranque, aparecerá una pantalla azul de MOK Manager"
-    echo "3. Selecciona 'Enroll MOK' -> 'Continue' -> 'Yes'"
-    echo "4. Ingresa una contraseña temporal cuando se solicite"
-    echo "5. Selecciona 'Reboot'"
-    echo "6. Después del reinicio, ejecuta el script de verificación"
+    echo "2. Durante el arranque, DEBE aparecer una pantalla azul de MOK Manager"
+    echo "3. Si NO aparece MOK Manager:"
+    echo "   - Reinicia manualmente y presiona una tecla durante el arranque"
+    echo "   - O ejecuta: sudo mokutil --list-new (para verificar MOKs pendientes)"
+    echo "4. En MOK Manager:"
+    echo "   - Selecciona 'Enroll MOK' → 'Continue' → 'Yes'"
+    echo "   - Ingresa la contraseña: SecureBoot123"
+    echo "   - Selecciona 'Reboot'"
+    echo "5. Después del reinicio, el sistema verificará automáticamente"
     echo
+    print_warning "¡IMPORTANTE! Contraseña MOK: SecureBoot123"
     print_warning "¡IMPORTANTE! Guarda este log: $LOG_FILE"
     echo
     
